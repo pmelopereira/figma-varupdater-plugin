@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 12px;
+      color: #333;
+      background: #fff;
+      padding: 16px;
+      min-height: 100%;
+    }
+
+    h2 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      color: #888;
+      font-size: 11px;
+      margin-bottom: 16px;
+    }
+
+    /* Drop zone */
+    .drop-zone {
+      border: 2px dashed #d0d0d0;
+      border-radius: 8px;
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.15s;
+      background: #fafafa;
+      margin-bottom: 12px;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #7a5af8;
+      background: #f4f3ff;
+    }
+    .drop-zone-icon {
+      font-size: 28px;
+      margin-bottom: 6px;
+      display: block;
+    }
+    .drop-zone-text {
+      font-size: 12px;
+      color: #666;
+    }
+    .drop-zone-text strong {
+      color: #7a5af8;
+      cursor: pointer;
+    }
+
+    input[type="file"] { display: none; }
+
+    /* File info */
+    .file-info {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #f4f3ff;
+      border: 1px solid #d9d6fe;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+    .file-info.visible { display: flex; }
+    .file-name {
+      flex: 1;
+      font-weight: 500;
+      color: #5925dc;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .file-meta {
+      color: #888;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .file-remove {
+      cursor: pointer;
+      color: #999;
+      font-size: 16px;
+      line-height: 1;
+      padding: 2px;
+    }
+    .file-remove:hover { color: #e53e3e; }
+
+    /* Preview */
+    .preview {
+      display: none;
+      margin-bottom: 12px;
+    }
+    .preview.visible { display: block; }
+    .preview-header {
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .preview-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    .preview-table th {
+      text-align: left;
+      font-weight: 600;
+      color: #888;
+      padding: 4px 6px;
+      border-bottom: 1px solid #eee;
+    }
+    .preview-table td {
+      padding: 3px 6px;
+      border-bottom: 1px solid #f5f5f5;
+    }
+    .preview-table .val-color {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      border: 1px solid #ddd;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+    .preview-scroll {
+      max-height: 180px;
+      overflow-y: auto;
+      border: 1px solid #eee;
+      border-radius: 6px;
+    }
+    .preview-more {
+      text-align: center;
+      color: #888;
+      font-size: 11px;
+      padding: 4px;
+      background: #fafafa;
+    }
+
+    /* Schema info */
+    .schema-info {
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      background: #f8f8f8;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.5;
+    }
+    .schema-info code {
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      font-size: 10px;
+      background: #eaeaea;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+
+    /* Buttons */
+    .actions {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      flex: 1;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: #7a5af8;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #6938ef; }
+    .btn-primary:disabled {
+      background: #d0d0d0;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: #f0f0f0;
+      color: #555;
+    }
+    .btn-secondary:hover { background: #e4e4e7; }
+
+    /* Log */
+    .log-area {
+      display: none;
+      margin-top: 12px;
+    }
+    .log-area.visible { display: block; }
+    .log-header {
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .log {
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      font-size: 10px;
+      background: #18181b;
+      color: #e4e4e7;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .log .ok { color: #4ade80; }
+    .log .err { color: #f87171; }
+    .log .info { color: #a1a1aa; }
+    .log .summary { color: #fbbf24; font-weight: 600; }
+
+    /* Dry-run toggle */
+    .options {
+      display: none;
+      margin-bottom: 12px;
+      align-items: center;
+      gap: 8px;
+    }
+    .options.visible { display: flex; }
+    .options label {
+      font-size: 11px;
+      color: #666;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Variable Updater</h2>
+  <p class="subtitle">Import a JSON file to update Figma Local Variables</p>
+
+  <div class="drop-zone" id="dropZone">
+    <span class="drop-zone-icon">📁</span>
+    <p class="drop-zone-text">
+      Drop a JSON file here or <strong id="browseLink">browse</strong>
+    </p>
+  </div>
+  <input type="file" id="fileInput" accept=".json">
+
+  <div class="file-info" id="fileInfo">
+    <span class="file-name" id="fileName"></span>
+    <span class="file-meta" id="fileMeta"></span>
+    <span class="file-remove" id="fileRemove" title="Remove">✕</span>
+  </div>
+
+  <div class="preview" id="preview">
+    <div class="preview-header">Preview</div>
+    <div class="preview-scroll">
+      <table class="preview-table">
+        <thead><tr><th>Collection</th><th>Variable</th><th>Mode</th><th>Value</th></tr></thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+      <div class="preview-more" id="previewMore"></div>
+    </div>
+  </div>
+
+  <div class="options" id="options">
+    <label>
+      <input type="checkbox" id="dryRun"> Dry run (preview only, no changes)
+    </label>
+  </div>
+
+  <div class="actions">
+    <button class="btn-secondary" id="btnSchema">Schema</button>
+    <button class="btn-primary" id="btnApply" disabled>Apply Overrides</button>
+  </div>
+
+  <div class="schema-info" id="schemaInfo" style="display:none; margin-top:12px;">
+    <strong>JSON Schema:</strong><br>
+    Array of override objects:<br><br>
+    <code>{ "collection": "Primitives", "variable": "Colors/Brand/500", "value": "#7a5af8" }</code><br><br>
+    <strong>Fields:</strong><br>
+    • <code>collection</code> — name (substring match) of the variable collection<br>
+    • <code>variable</code> — full variable path (e.g. <code>Colors/Gray (light mode)/500</code>)<br>
+    • <code>mode</code> — (optional) mode name (e.g. <code>Light mode</code>, <code>Dark mode</code>). Defaults to first mode.<br>
+    • <code>value</code> — hex color (<code>#rrggbb</code> or <code>#rrggbbaa</code>), number, or string<br><br>
+    <strong>Value types:</strong><br>
+    • Colors: <code>"#6938ef"</code> or with alpha <code>"#09090b1a"</code><br>
+    • Numbers: <code>12</code>, <code>16.5</code><br>
+    • Strings/fonts: <code>"Sora"</code><br>
+  </div>
+
+  <div class="log-area" id="logArea">
+    <div class="log-header">Log</div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script>
+    var parsedOverrides = null;
+
+    // --- File handling ---
+    var dropZone = document.getElementById('dropZone');
+    var fileInput = document.getElementById('fileInput');
+    var browseLink = document.getElementById('browseLink');
+    var fileInfo = document.getElementById('fileInfo');
+    var fileName = document.getElementById('fileName');
+    var fileMeta = document.getElementById('fileMeta');
+    var fileRemove = document.getElementById('fileRemove');
+    var preview = document.getElementById('preview');
+    var previewBody = document.getElementById('previewBody');
+    var previewMore = document.getElementById('previewMore');
+    var options = document.getElementById('options');
+    var btnApply = document.getElementById('btnApply');
+    var btnSchema = document.getElementById('btnSchema');
+    var schemaInfo = document.getElementById('schemaInfo');
+    var logArea = document.getElementById('logArea');
+    var logEl = document.getElementById('log');
+
+    browseLink.addEventListener('click', function() { fileInput.click(); });
+    dropZone.addEventListener('click', function() { fileInput.click(); });
+
+    dropZone.addEventListener('dragover', function(e) {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', function() {
+      dropZone.classList.remove('dragover');
+    });
+    dropZone.addEventListener('drop', function(e) {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', function() {
+      if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
+    });
+
+    fileRemove.addEventListener('click', resetFile);
+
+    function resetFile() {
+      parsedOverrides = null;
+      fileInfo.classList.remove('visible');
+      preview.classList.remove('visible');
+      options.classList.remove('visible');
+      dropZone.style.display = '';
+      btnApply.disabled = true;
+      logArea.classList.remove('visible');
+      fileInput.value = '';
+    }
+
+    function handleFile(file) {
+      if (!file.name.endsWith('.json')) {
+        alert('Please select a .json file');
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          var data = JSON.parse(e.target.result);
+          if (!Array.isArray(data)) {
+            alert('JSON must be an array of override objects.\nSee "Schema" for the expected format.');
+            return;
+          }
+          // Validate structure
+          var valid = true;
+          for (var i = 0; i < data.length; i++) {
+            if (!data[i].collection || !data[i].variable || data[i].value === undefined) {
+              alert('Invalid override at index ' + i + '.\nEach item needs: collection, variable, value');
+              valid = false;
+              break;
+            }
+          }
+          if (!valid) return;
+
+          parsedOverrides = data;
+          dropZone.style.display = 'none';
+          fileName.textContent = file.name;
+          fileMeta.textContent = data.length + ' overrides';
+          fileInfo.classList.add('visible');
+          options.classList.add('visible');
+          btnApply.disabled = false;
+          logArea.classList.remove('visible');
+          showPreview(data);
+        } catch (err) {
+          alert('Invalid JSON: ' + err.message);
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    function showPreview(data) {
+      previewBody.innerHTML = '';
+      var maxShow = 20;
+      var count = Math.min(data.length, maxShow);
+      for (var i = 0; i < count; i++) {
+        var ov = data[i];
+        var tr = document.createElement('tr');
+
+        var tdCol = document.createElement('td');
+        tdCol.textContent = ov.collection;
+        tr.appendChild(tdCol);
+
+        var tdVar = document.createElement('td');
+        tdVar.textContent = ov.variable;
+        tr.appendChild(tdVar);
+
+        var tdMode = document.createElement('td');
+        tdMode.textContent = ov.mode || '—';
+        tr.appendChild(tdMode);
+
+        var tdVal = document.createElement('td');
+        if (typeof ov.value === 'string' && ov.value.charAt(0) === '#') {
+          var swatch = document.createElement('span');
+          swatch.className = 'val-color';
+          swatch.style.background = ov.value.length <= 7 ? ov.value : '#' + ov.value.slice(1, 7);
+          tdVal.appendChild(swatch);
+        }
+        tdVal.appendChild(document.createTextNode(
+          typeof ov.value === 'string' ? ov.value : String(ov.value)
+        ));
+        tr.appendChild(tdVal);
+
+        previewBody.appendChild(tr);
+      }
+      if (data.length > maxShow) {
+        previewMore.textContent = '+ ' + (data.length - maxShow) + ' more overrides';
+        previewMore.style.display = '';
+      } else {
+        previewMore.style.display = 'none';
+      }
+      preview.classList.add('visible');
+    }
+
+    // --- Schema toggle ---
+    btnSchema.addEventListener('click', function() {
+      schemaInfo.style.display = schemaInfo.style.display === 'none' ? 'block' : 'none';
+    });
+
+    // --- Apply ---
+    btnApply.addEventListener('click', function() {
+      if (!parsedOverrides) return;
+      btnApply.disabled = true;
+      btnApply.textContent = 'Applying...';
+      logArea.classList.add('visible');
+      logEl.innerHTML = '<span class="info">Starting...</span>\n';
+
+      var dryRun = document.getElementById('dryRun').checked;
+
+      parent.postMessage({
+        pluginMessage: {
+          type: 'apply-overrides',
+          overrides: parsedOverrides,
+          dryRun: dryRun
+        }
+      }, '*');
+    });
+
+    // --- Messages from main code ---
+    window.onmessage = function(event) {
+      var msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      if (msg.type === 'log') {
+        var span = document.createElement('span');
+        span.className = msg.level || 'info';
+        span.textContent = msg.text + '\n';
+        logEl.appendChild(span);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      if (msg.type === 'done') {
+        btnApply.disabled = false;
+        btnApply.textContent = 'Apply Overrides';
+
+        var span = document.createElement('span');
+        span.className = 'summary';
+        span.textContent = '\n' + msg.summary + '\n';
+        logEl.appendChild(span);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    };
+  </script>
+</body>
+</html>
