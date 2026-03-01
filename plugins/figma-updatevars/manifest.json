@@ -1,5 +1,5 @@
 {
-  "name": "figma-updatevars-plugin",
+  "name": "Figma Update Vars",
   "id": "figma-updatevars-plugin",
   "api": "1.0.0",
   "main": "code.js",
