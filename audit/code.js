@@ -50,6 +50,15 @@ function collectNodes(node, list) {
   }
 }
 
+function hexToRgb01(hex) {
+  hex = hex.replace('#', '');
+  return {
+    r: parseInt(hex.slice(0, 2), 16) / 255,
+    g: parseInt(hex.slice(2, 4), 16) / 255,
+    b: parseInt(hex.slice(4, 6), 16) / 255,
+  };
+}
+
 // ──────────────────────────────────────────────
 // Build runtime detection maps from config
 // ──────────────────────────────────────────────
@@ -377,6 +386,7 @@ async function runAudit() {
 
   var hasFixConfig = config && config.fix && (
     (config.fix.colorToVariable && Object.keys(config.fix.colorToVariable).length > 0) ||
+    (config.fix.colorReplace && Object.keys(config.fix.colorReplace).length > 0) ||
     (config.fix.fontReplace && Object.keys(config.fix.fontReplace).length > 0)
   );
 
@@ -402,14 +412,26 @@ async function runFix(dryRun) {
     colorFixed: 0, colorFailed: 0, colorSkipped: 0,
     fontFixed: 0, fontFailed: 0, fontSkipped: 0,
     styleFixed: 0, styleFailed: 0,
+    effectFixed: 0, effectFailed: 0, effectSkipped: 0,
   };
 
-  // ── Fix hardcoded colors → bind to variables ──
-  if (config.fix.colorToVariable && Object.keys(config.fix.colorToVariable).length > 0) {
-    var colorMap = {};
+  // Build color maps
+  var colorMap = {};
+  if (config.fix.colorToVariable) {
     Object.keys(config.fix.colorToVariable).forEach(function(hex) {
       colorMap[hex.toLowerCase()] = config.fix.colorToVariable[hex];
     });
+  }
+  var hexReplace = {};
+  if (config.fix.colorReplace) {
+    Object.keys(config.fix.colorReplace).forEach(function(hex) {
+      hexReplace[hex.toLowerCase()] = config.fix.colorReplace[hex].toLowerCase();
+    });
+  }
+  var hasColorFix = Object.keys(colorMap).length > 0 || Object.keys(hexReplace).length > 0;
+
+  // ── Fix hardcoded colors → bind to variables or replace hex ──
+  if (hasColorFix) {
 
     // Load all COLOR variables for lookup
     var allVars = await figma.variables.getLocalVariablesAsync('COLOR');
@@ -428,88 +450,173 @@ async function runFix(dryRun) {
     }
 
     // Fix node fills / strokes
-    sendLog('\n--- Fixing node colors ---');
+    sendLog('\n--- Fixing node colors (' + lastAuditResult.hardcodedOldColors.length + ') ---');
     for (var ci = 0; ci < lastAuditResult.hardcodedOldColors.length; ci++) {
       var item = lastAuditResult.hardcodedOldColors[ci];
+
+      // Strategy 1: bind to variable
       var targetVarName = colorMap[item.hex];
-      if (!targetVarName) {
-        sendLog('  SKIP ' + item.hex + ' (' + item.oldName + ') — no mapping', 'info');
-        stats.colorSkipped++;
-        continue;
-      }
+      var variable = targetVarName ? findVariable(targetVarName) : null;
 
-      var variable = findVariable(targetVarName);
-      if (!variable) {
-        sendLog('  FAIL variable "' + targetVarName + '" not found for ' + item.hex, 'err');
-        stats.colorFailed++;
-        continue;
-      }
-
-      if (dryRun) {
-        sendLog('  WOULD FIX ' + item.nodeName + ' ' + item.property + ' ' + item.hex + ' → ' + variable.name, 'ok');
-        stats.colorFixed++;
-        continue;
-      }
-
-      try {
-        var node = await figma.getNodeByIdAsync(item.nodeId);
-        if (!node) throw new Error('node not found');
-
-        if (item.property === 'fill') {
-          var fills = JSON.parse(JSON.stringify(node.fills));
-          fills[item.paintIndex] = figma.variables.setBoundVariableForPaint(
-            fills[item.paintIndex], 'color', variable
-          );
-          node.fills = fills;
-        } else if (item.property === 'stroke') {
-          var strokes = JSON.parse(JSON.stringify(node.strokes));
-          strokes[item.paintIndex] = figma.variables.setBoundVariableForPaint(
-            strokes[item.paintIndex], 'color', variable
-          );
-          node.strokes = strokes;
+      if (variable) {
+        if (dryRun) {
+          sendLog('  WOULD BIND ' + item.nodeName + ' ' + item.property + ' ' + item.hex + ' → ' + variable.name, 'ok');
+          stats.colorFixed++;
+          continue;
         }
-        sendLog('  FIXED ' + item.nodeName + ' ' + item.property + ' → ' + variable.name, 'ok');
-        stats.colorFixed++;
-      } catch (e) {
-        sendLog('  FAIL ' + item.nodeName + ' — ' + e.message, 'err');
-        stats.colorFailed++;
+        try {
+          var node = await figma.getNodeByIdAsync(item.nodeId);
+          if (!node) throw new Error('node not found');
+          if (item.property === 'fill') {
+            var fills = JSON.parse(JSON.stringify(node.fills));
+            fills[item.paintIndex] = figma.variables.setBoundVariableForPaint(
+              fills[item.paintIndex], 'color', variable
+            );
+            node.fills = fills;
+          } else {
+            var strokes = JSON.parse(JSON.stringify(node.strokes));
+            strokes[item.paintIndex] = figma.variables.setBoundVariableForPaint(
+              strokes[item.paintIndex], 'color', variable
+            );
+            node.strokes = strokes;
+          }
+          sendLog('  BOUND ' + item.nodeName + ' ' + item.property + ' → ' + variable.name, 'ok');
+          stats.colorFixed++;
+        } catch (e) {
+          sendLog('  FAIL ' + item.nodeName + ' — ' + e.message, 'err');
+          stats.colorFailed++;
+        }
+        continue;
       }
+
+      // Strategy 2: direct hex replacement
+      var replHex = hexReplace[item.hex];
+      if (replHex) {
+        if (dryRun) {
+          sendLog('  WOULD REPLACE ' + item.nodeName + ' ' + item.property + ' ' + item.hex + ' → ' + replHex, 'ok');
+          stats.colorFixed++;
+          continue;
+        }
+        try {
+          var rNode = await figma.getNodeByIdAsync(item.nodeId);
+          if (!rNode) throw new Error('node not found');
+          var newRgb = hexToRgb01(replHex);
+          if (item.property === 'fill') {
+            var rFills = JSON.parse(JSON.stringify(rNode.fills));
+            rFills[item.paintIndex].color = newRgb;
+            rNode.fills = rFills;
+          } else {
+            var rStrokes = JSON.parse(JSON.stringify(rNode.strokes));
+            rStrokes[item.paintIndex].color = newRgb;
+            rNode.strokes = rStrokes;
+          }
+          sendLog('  REPLACED ' + item.nodeName + ' ' + item.property + ' → ' + replHex, 'ok');
+          stats.colorFixed++;
+        } catch (e) {
+          sendLog('  FAIL ' + item.nodeName + ' — ' + e.message, 'err');
+          stats.colorFailed++;
+        }
+        continue;
+      }
+
+      stats.colorSkipped++;
+    }
+
+    // Deduplicate skip messages
+    if (stats.colorSkipped > 0) {
+      sendLog('  SKIPPED ' + stats.colorSkipped + ' nodes — no mapping', 'info');
     }
 
     // Fix paint styles
     if (lastAuditResult.paintStyleIssues.length > 0) {
-      sendLog('\n--- Fixing paint styles ---');
+      sendLog('\n--- Fixing paint styles (' + lastAuditResult.paintStyleIssues.length + ') ---');
       for (var pi = 0; pi < lastAuditResult.paintStyleIssues.length; pi++) {
         var pItem = lastAuditResult.paintStyleIssues[pi];
-        var pTargetName = colorMap[pItem.hex];
-        if (!pTargetName) { stats.colorSkipped++; continue; }
 
-        var pVar = findVariable(pTargetName);
-        if (!pVar) {
-          sendLog('  FAIL variable "' + pTargetName + '" not found for style ' + pItem.styleName, 'err');
-          stats.styleFailed++;
+        // Strategy 1: bind to variable
+        var pTargetName = colorMap[pItem.hex];
+        var pVar = pTargetName ? findVariable(pTargetName) : null;
+
+        if (pVar) {
+          if (dryRun) {
+            sendLog('  WOULD BIND style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
+            stats.styleFixed++; continue;
+          }
+          try {
+            var pStyle = figma.getStyleById(pItem.styleId);
+            if (!pStyle) throw new Error('style not found');
+            var paints = JSON.parse(JSON.stringify(pStyle.paints));
+            paints[pItem.paintIndex] = figma.variables.setBoundVariableForPaint(
+              paints[pItem.paintIndex], 'color', pVar
+            );
+            pStyle.paints = paints;
+            sendLog('  BOUND style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
+            stats.styleFixed++;
+          } catch (e) {
+            sendLog('  FAIL style ' + pItem.styleName + ' — ' + e.message, 'err');
+            stats.styleFailed++;
+          }
+          continue;
+        }
+
+        // Strategy 2: direct hex replacement
+        var pReplHex = hexReplace[pItem.hex];
+        if (pReplHex) {
+          if (dryRun) {
+            sendLog('  WOULD REPLACE style ' + pItem.styleName + ' ' + pItem.hex + ' → ' + pReplHex, 'ok');
+            stats.styleFixed++; continue;
+          }
+          try {
+            var pStyle2 = figma.getStyleById(pItem.styleId);
+            if (!pStyle2) throw new Error('style not found');
+            var paints2 = JSON.parse(JSON.stringify(pStyle2.paints));
+            paints2[pItem.paintIndex].color = hexToRgb01(pReplHex);
+            pStyle2.paints = paints2;
+            sendLog('  REPLACED style ' + pItem.styleName + ' → ' + pReplHex, 'ok');
+            stats.styleFixed++;
+          } catch (e) {
+            sendLog('  FAIL style ' + pItem.styleName + ' — ' + e.message, 'err');
+            stats.styleFailed++;
+          }
+          continue;
+        }
+
+        sendLog('  SKIP style ' + pItem.styleName + ' — no mapping for ' + pItem.hex, 'info');
+      }
+    }
+
+    // Fix effect styles (shadows — can't bind variables, hex replace only)
+    if (lastAuditResult.effectStyleIssues && lastAuditResult.effectStyleIssues.length > 0) {
+      sendLog('\n--- Fixing effect styles (' + lastAuditResult.effectStyleIssues.length + ') ---');
+      for (var ei = 0; ei < lastAuditResult.effectStyleIssues.length; ei++) {
+        var eItem = lastAuditResult.effectStyleIssues[ei];
+        var eReplHex = hexReplace[eItem.hex];
+        if (!eReplHex) {
+          sendLog('  SKIP effect ' + eItem.styleName + ' — no colorReplace for ' + eItem.hex, 'info');
+          stats.effectSkipped++;
           continue;
         }
 
         if (dryRun) {
-          sendLog('  WOULD FIX style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
-          stats.styleFixed++;
+          sendLog('  WOULD REPLACE effect ' + eItem.styleName + ' shadow base ' + eItem.hex + ' → ' + eReplHex, 'ok');
+          stats.effectFixed++;
           continue;
         }
 
         try {
-          var pStyle = figma.getStyleById(pItem.styleId);
-          if (!pStyle) throw new Error('style not found');
-          var paints = JSON.parse(JSON.stringify(pStyle.paints));
-          paints[pItem.paintIndex] = figma.variables.setBoundVariableForPaint(
-            paints[pItem.paintIndex], 'color', pVar
-          );
-          pStyle.paints = paints;
-          sendLog('  FIXED style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
-          stats.styleFixed++;
+          var eStyle = figma.getStyleById(eItem.styleId);
+          if (!eStyle) throw new Error('style not found');
+          var effects = JSON.parse(JSON.stringify(eStyle.effects));
+          var eff = effects[eItem.effectIndex];
+          var newRgb = hexToRgb01(eReplHex);
+          // Preserve original alpha
+          eff.color = { r: newRgb.r, g: newRgb.g, b: newRgb.b, a: eff.color.a };
+          eStyle.effects = effects;
+          sendLog('  REPLACED effect ' + eItem.styleName + ' → base ' + eReplHex + ' (alpha preserved)', 'ok');
+          stats.effectFixed++;
         } catch (e) {
-          sendLog('  FAIL style ' + pItem.styleName + ' — ' + e.message, 'err');
-          stats.styleFailed++;
+          sendLog('  FAIL effect ' + eItem.styleName + ' — ' + e.message, 'err');
+          stats.effectFailed++;
         }
       }
     }
@@ -605,12 +712,13 @@ async function runFix(dryRun) {
   sendLog('\n══════════════════════════════════════════');
   sendLog((dryRun ? 'DRY RUN' : 'FIX') + ' SUMMARY', 'summary');
   sendLog('══════════════════════════════════════════');
-  sendLog('Colors: ' + stats.colorFixed + ' fixed, ' + stats.colorFailed + ' failed, ' + stats.colorSkipped + ' skipped');
-  sendLog('Fonts:  ' + stats.fontFixed + ' fixed, ' + stats.fontFailed + ' failed, ' + stats.fontSkipped + ' skipped');
-  sendLog('Styles: ' + stats.styleFixed + ' fixed, ' + stats.styleFailed + ' failed');
+  sendLog('Colors:  ' + stats.colorFixed + ' fixed, ' + stats.colorFailed + ' failed, ' + stats.colorSkipped + ' skipped');
+  sendLog('Fonts:   ' + stats.fontFixed + ' fixed, ' + stats.fontFailed + ' failed, ' + stats.fontSkipped + ' skipped');
+  sendLog('Styles:  ' + stats.styleFixed + ' fixed, ' + stats.styleFailed + ' failed');
+  sendLog('Effects: ' + stats.effectFixed + ' fixed, ' + stats.effectFailed + ' failed, ' + stats.effectSkipped + ' skipped');
 
-  var totalFixed = stats.colorFixed + stats.fontFixed + stats.styleFixed;
-  var totalFailed = stats.colorFailed + stats.fontFailed + stats.styleFailed;
+  var totalFixed = stats.colorFixed + stats.fontFixed + stats.styleFixed + stats.effectFixed;
+  var totalFailed = stats.colorFailed + stats.fontFailed + stats.styleFailed + stats.effectFailed;
 
   if (!dryRun && totalFixed > 0) {
     sendLog('\nRe-run audit to verify results.', 'info');
@@ -638,10 +746,11 @@ figma.ui.onmessage = function(msg) {
     var cShadows = config.detect && config.detect.shadowBases ? Object.keys(config.detect.shadowBases).length : 0;
     var cFonts = config.detect && config.detect.fonts ? config.detect.fonts.length : 0;
     var fColors = config.fix && config.fix.colorToVariable ? Object.keys(config.fix.colorToVariable).length : 0;
+    var fReplace = config.fix && config.fix.colorReplace ? Object.keys(config.fix.colorReplace).length : 0;
     var fFonts = config.fix && config.fix.fontReplace ? Object.keys(config.fix.fontReplace).length : 0;
 
     sendLog('  Detect: ' + cColors + ' colors, ' + cShadows + ' shadow bases, ' + cFonts + ' allowed fonts');
-    sendLog('  Fix:    ' + fColors + ' color→variable, ' + fFonts + ' font→font');
+    sendLog('  Fix:    ' + fColors + ' color→variable, ' + fReplace + ' color→hex, ' + fFonts + ' font→font');
 
     figma.ui.postMessage({
       type: 'config-loaded',
@@ -650,6 +759,7 @@ figma.ui.onmessage = function(msg) {
       detectShadows: cShadows,
       detectFonts: cFonts,
       fixColors: fColors,
+      fixReplace: fReplace,
       fixFonts: fFonts,
     });
   }

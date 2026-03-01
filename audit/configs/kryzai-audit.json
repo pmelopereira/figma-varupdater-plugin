@@ -59,7 +59,14 @@
       "#4338ca": "Colors/Brand/700",
       "#3730a3": "Colors/Brand/800",
       "#312e81": "Colors/Brand/900",
-      "#1e1b4b": "Colors/Brand/950"
+      "#1e1b4b": "Colors/Brand/950",
+
+      "#0a0d12": "Colors/Gray/Light mode/950"
+    },
+    "colorReplace": {
+      "#0a0d12": "#09090b",
+      "#0c0e12": "#0f0f11",
+      "#0c111d": "#09090b"
     },
     "fontReplace": {
       "*": "Inter"

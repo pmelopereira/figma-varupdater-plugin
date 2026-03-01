@@ -390,9 +390,10 @@
         html += '<span class="config-stat">Detect: ' + msg.detectColors + ' colors, '
               + msg.detectShadows + ' shadow bases, '
               + msg.detectFonts + ' allowed fonts</span>';
-        if (msg.fixColors > 0 || msg.fixFonts > 0) {
+        if (msg.fixColors > 0 || msg.fixReplace > 0 || msg.fixFonts > 0) {
           html += '<br><span class="config-fix">Fix: '
                 + msg.fixColors + ' color→variable, '
+                + msg.fixReplace + ' color→hex, '
                 + msg.fixFonts + ' font→font</span>';
         }
         configSummaryEl.innerHTML = html;
