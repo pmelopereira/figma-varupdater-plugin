@@ -20,7 +20,7 @@ Usage:
         --fonts Sora,Inter \\
         -o      my-audit.json
 
-The overrides files use the same format as figma-varupdater-plugin:
+The overrides files use the same format as figma-updatevars-plugin:
     [
       { "collection": "...", "variable": "...", "mode": "...", "value": "..." },
       ...
@@ -28,7 +28,7 @@ The overrides files use the same format as figma-varupdater-plugin:
 
 Workflow:
     1. Export Figma Variables BEFORE migration (Tokens Studio → figma-vars-to-overrides.py)
-    2. Apply overrides with figma-varupdater-plugin
+    2. Apply overrides with figma-updatevars-plugin
     3. Export AFTER (same flow)
     4. Run this script with --before and --after
     5. Drop the generated JSON into the Design System Auditor plugin

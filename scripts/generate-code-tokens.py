@@ -2,7 +2,7 @@
 """
 generate-code-tokens.py
 
-Reads a figma-varupdater-plugin overrides JSON and generates:
+Reads a figma-updatevars-plugin overrides JSON and generates:
   1. CSS custom properties (tokens.css)
   2. Tailwind CSS config extension (tailwind-tokens.mjs)
 
@@ -52,7 +52,7 @@ def group_by_collection(overrides):
 def generate_css(overrides, collections_order=None):
     """Generate CSS custom properties from overrides."""
     lines = []
-    lines.append("/* Auto-generated from figma-varupdater-plugin overrides */")
+    lines.append("/* Auto-generated from figma-updatevars-plugin overrides */")
     lines.append("/* Do not edit manually — regenerate with generate-code-tokens.py */")
     lines.append("")
 
@@ -112,7 +112,7 @@ def generate_css(overrides, collections_order=None):
 def generate_tailwind(overrides):
     """Generate a Tailwind config extension module from overrides."""
     lines = []
-    lines.append("// Auto-generated from figma-varupdater-plugin overrides")
+    lines.append("// Auto-generated from figma-updatevars-plugin overrides")
     lines.append("// Do not edit manually — regenerate with generate-code-tokens.py")
     lines.append("")
     lines.append("const tokens = {};")

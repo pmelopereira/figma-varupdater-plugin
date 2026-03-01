@@ -3,7 +3,7 @@
 figma-vars-to-overrides.py
 
 Reads a Figma Variables JSON export (DTCG format) and outputs
-an overrides JSON array compatible with the figma-varupdater-plugin.
+an overrides JSON array compatible with the figma-updatevars-plugin.
 
 Usage:
     python3 figma-vars-to-overrides.py <input.json> [-o output.json]

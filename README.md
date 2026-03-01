@@ -1,4 +1,4 @@
-# figma-varupdater-plugin
+# figma-updatevars-plugin
 
 A Figma plugin toolkit for design system retheming: batch-update Local Variables, audit for old-theme remnants, auto-fix issues, and generate code tokens — all config-driven, no hardcoded values.
 
@@ -71,7 +71,7 @@ python3 scripts/figma-vars-to-overrides.py tokens-before.json --skip-aliases -o 
 
 Create or obtain an overrides JSON (manually, or from a brand token generator), then:
 
-1. Figma → Plugins → Development → **figma-varupdater-plugin**
+1. Figma → Plugins → Development → **figma-updatevars-plugin**
 2. Drop `overrides.json` → preview → Apply
 
 **Step 3 — Snapshot "after"**
@@ -128,7 +128,7 @@ python3 scripts/generate-code-tokens.py after.json -o ./code-tokens
 
 1. In Figma → **Plugins → Development → Import plugin from manifest…**
 2. Select `manifest.json` from the repo root
-3. Appears under **Plugins → Development → figma-varupdater-plugin**
+3. Appears under **Plugins → Development → figma-updatevars-plugin**
 
 ### Features
 

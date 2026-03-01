@@ -1,6 +1,6 @@
 {
-  "name": "figma-varupdater-plugin",
-  "id": "figma-varupdater-plugin",
+  "name": "Design System Auditor",
+  "id": "figma-ds-audit-plugin",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
