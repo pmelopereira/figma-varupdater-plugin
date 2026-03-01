@@ -14,6 +14,20 @@ var lastAuditResult = null;  // saved for fix-all
 // ──────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────
+
+// Pack RGB 0-1 floats into a single 24-bit integer for O(1) numeric comparison
+// (avoids expensive hex string building in hot loops)
+function colorToKey(c) {
+  return ((Math.round(c.r * 255) << 16) | (Math.round(c.g * 255) << 8) | Math.round(c.b * 255));
+}
+
+function hexToColorKey(hex) {
+  hex = hex.replace('#', '');
+  return ((parseInt(hex.slice(0, 2), 16) << 16) |
+          (parseInt(hex.slice(2, 4), 16) << 8) |
+          parseInt(hex.slice(4, 6), 16));
+}
+
 function rgbaToHex(c) {
   var r = Math.round(c.r * 255);
   var g = Math.round(c.g * 255);
@@ -25,29 +39,31 @@ function rgbaToHex(c) {
   return hex.toLowerCase();
 }
 
+// Batched logging — reduces postMessage IPC overhead
+var _logBuffer = [];
+var _logFlushTimer = null;
+
 function sendLog(text, level) {
-  figma.ui.postMessage({ type: 'log', text: text, level: level || 'info' });
+  _logBuffer.push({ type: 'log', text: text, level: level || 'info' });
+  if (!_logFlushTimer) {
+    _logFlushTimer = setTimeout(flushLogs, 0);
+  }
+}
+
+function flushLogs() {
+  _logFlushTimer = null;
+  if (_logBuffer.length === 0) return;
+  if (_logBuffer.length === 1) {
+    figma.ui.postMessage(_logBuffer[0]);
+  } else {
+    figma.ui.postMessage({ type: 'log-batch', items: _logBuffer });
+  }
+  _logBuffer = [];
 }
 
 function sendProgress(current, total) {
+  flushLogs(); // flush pending logs before progress update
   figma.ui.postMessage({ type: 'progress', current: current, total: total });
-}
-
-function getPageName(node) {
-  var current = node;
-  while (current.parent && current.parent.type !== 'DOCUMENT') {
-    current = current.parent;
-  }
-  return current.name || '(unknown)';
-}
-
-function collectNodes(node, list) {
-  list.push(node);
-  if ('children' in node) {
-    for (var i = 0; i < node.children.length; i++) {
-      collectNodes(node.children[i], list);
-    }
-  }
 }
 
 function hexToRgb01(hex) {
@@ -61,45 +77,58 @@ function hexToRgb01(hex) {
 
 // ──────────────────────────────────────────────
 // Build runtime detection maps from config
+// Uses Map for faster hot-path lookups (like figma-updatevars)
+// Also builds numeric-key maps for fast color matching
 // ──────────────────────────────────────────────
 function buildDetectionMaps() {
-  var detectColors = {};
-  var detectShadowBases = {};
-  var allowedFonts = [];
+  // Map<number (colorKey), {label, hex}> for numeric O(1) lookups in audit loop
+  var detectColorKeys = new Map();
+  // Map<number, {label, hex}> for shadow base subset
+  var detectShadowKeys = new Map();
+  var allowedFontsSet = new Set();
 
   if (config && config.detect) {
     if (config.detect.colors) {
-      Object.keys(config.detect.colors).forEach(function(hex) {
-        detectColors[hex.toLowerCase()] = config.detect.colors[hex];
-      });
+      var keys = Object.keys(config.detect.colors);
+      for (var i = 0; i < keys.length; i++) {
+        var hex = keys[i];
+        var ck = hexToColorKey(hex);
+        detectColorKeys.set(ck, { label: config.detect.colors[hex], hex: hex.toLowerCase() });
+      }
     }
     if (config.detect.shadowBases) {
-      Object.keys(config.detect.shadowBases).forEach(function(hex) {
-        detectShadowBases[hex.toLowerCase()] = config.detect.shadowBases[hex];
+      var skeys = Object.keys(config.detect.shadowBases);
+      for (var i = 0; i < skeys.length; i++) {
+        var shex = skeys[i];
+        var sk = hexToColorKey(shex);
+        detectShadowKeys.set(sk, { label: config.detect.shadowBases[shex], hex: shex.toLowerCase() });
         // Shadow bases are also flagged as old colors
-        detectColors[hex.toLowerCase()] = config.detect.shadowBases[hex];
-      });
+        detectColorKeys.set(sk, { label: config.detect.shadowBases[shex], hex: shex.toLowerCase() });
+      }
     }
     if (config.detect.fonts && Array.isArray(config.detect.fonts)) {
-      allowedFonts = config.detect.fonts;
+      for (var i = 0; i < config.detect.fonts.length; i++) {
+        allowedFontsSet.add(config.detect.fonts[i]);
+      }
     }
   }
 
   return {
-    detectColors: detectColors,
-    detectShadowBases: detectShadowBases,
-    allowedFonts: allowedFonts,
+    detectColorKeys: detectColorKeys,
+    detectShadowKeys: detectShadowKeys,
+    allowedFontsSet: allowedFontsSet,
   };
 }
 
 // ──────────────────────────────────────────────
-// Main Audit
+// Main Audit  (optimized: iterative traversal, numeric color keys,
+//              cached page names, Map lookups, batched logging)
 // ──────────────────────────────────────────────
 async function runAudit() {
   var maps = buildDetectionMaps();
-  var hasColorDetection = Object.keys(maps.detectColors).length > 0;
-  var hasFontDetection = maps.allowedFonts.length > 0;
-  var hasShadowDetection = Object.keys(maps.detectShadowBases).length > 0;
+  var hasColorDetection = maps.detectColorKeys.size > 0;
+  var hasFontDetection = maps.allowedFontsSet.size > 0;
+  var hasShadowDetection = maps.detectShadowKeys.size > 0;
 
   sendLog('Theme Audit starting...');
   if (config && config.name) sendLog('Config: ' + config.name);
@@ -122,41 +151,62 @@ async function runAudit() {
     variableBoundStrokes: 0,
   };
 
+  // ── Iterative traversal (avoids stack overflow on deep trees) ──
+  // Also pre-computes page name per node during traversal
   var pages = figma.root.children;
   var allNodes = [];
+  var nodePageNames = [];  // parallel array: page name for allNodes[i]
+
   for (var p = 0; p < pages.length; p++) {
-    collectNodes(pages[p], allNodes);
+    var pageName = pages[p].name || '(unknown)';
+    // BFS with explicit stack — no recursion
+    var stack = [pages[p]];
+    while (stack.length > 0) {
+      var cur = stack.pop();
+      allNodes.push(cur);
+      nodePageNames.push(pageName);
+      if ('children' in cur) {
+        var ch = cur.children;
+        for (var ci = ch.length - 1; ci >= 0; ci--) {
+          stack.push(ch[ci]);
+        }
+      }
+    }
   }
-  issues.totalNodes = allNodes.length;
-  sendLog('Found ' + allNodes.length + ' nodes across ' + pages.length + ' pages');
 
-  var batchSize = 500;
+  var nodeCount = allNodes.length;
+  issues.totalNodes = nodeCount;
+  sendLog('Found ' + nodeCount + ' nodes across ' + pages.length + ' pages');
 
-  for (var i = 0; i < allNodes.length; i++) {
+  var batchSize = 2000; // larger batches = fewer yields, faster overall
+
+  for (var i = 0; i < nodeCount; i++) {
     var node = allNodes[i];
 
     // --- Fills ---
-    if ('fills' in node && Array.isArray(node.fills)) {
-      for (var f = 0; f < node.fills.length; f++) {
-        var fill = node.fills[f];
-        if (fill.type === 'SOLID' && fill.visible !== false) {
-          issues.totalWithFills++;
-          var hex = rgbaToHex(fill.color).slice(0, 7);
-          var isBound = false;
-          try {
-            var fb = node.boundVariables && node.boundVariables.fills;
-            if (fb && fb[f]) isBound = true;
-          } catch (e) {}
+    var fills = node.fills;
+    if (fills && fills !== figma.mixed && fills.length > 0) {
+      var bvFills = null;
+      if (hasColorDetection || true) { // always needed for binding stats
+        try { bvFills = node.boundVariables && node.boundVariables.fills; } catch (e) {}
+      }
+      for (var f = 0; f < fills.length; f++) {
+        var fill = fills[f];
+        if (fill.type !== 'SOLID' || fill.visible === false) continue;
+        issues.totalWithFills++;
 
-          if (isBound) {
-            issues.variableBoundFills++;
-          } else {
-            issues.unboundFills++;
-            if (hasColorDetection && maps.detectColors[hex]) {
+        if (bvFills && bvFills[f]) {
+          issues.variableBoundFills++;
+        } else {
+          issues.unboundFills++;
+          if (hasColorDetection) {
+            var fKey = colorToKey(fill.color);
+            var fMatch = maps.detectColorKeys.get(fKey);
+            if (fMatch) {
               issues.hardcodedOldColors.push({
-                nodeId: node.id, nodeName: node.name, page: getPageName(node),
-                property: 'fill', paintIndex: f, hex: hex,
-                oldName: maps.detectColors[hex],
+                nodeId: node.id, nodeName: node.name, page: nodePageNames[i],
+                property: 'fill', paintIndex: f, hex: fMatch.hex,
+                oldName: fMatch.label,
               });
             }
           }
@@ -165,27 +215,27 @@ async function runAudit() {
     }
 
     // --- Strokes ---
-    if ('strokes' in node && Array.isArray(node.strokes)) {
-      for (var s = 0; s < node.strokes.length; s++) {
-        var stroke = node.strokes[s];
-        if (stroke.type === 'SOLID' && stroke.visible !== false) {
-          issues.totalWithStrokes++;
-          var sHex = rgbaToHex(stroke.color).slice(0, 7);
-          var sIsBound = false;
-          try {
-            var sb = node.boundVariables && node.boundVariables.strokes;
-            if (sb && sb[s]) sIsBound = true;
-          } catch (e) {}
+    var strokes = node.strokes;
+    if (strokes && strokes !== figma.mixed && strokes.length > 0) {
+      var bvStrokes = null;
+      try { bvStrokes = node.boundVariables && node.boundVariables.strokes; } catch (e) {}
+      for (var s = 0; s < strokes.length; s++) {
+        var stroke = strokes[s];
+        if (stroke.type !== 'SOLID' || stroke.visible === false) continue;
+        issues.totalWithStrokes++;
 
-          if (sIsBound) {
-            issues.variableBoundStrokes++;
-          } else {
-            issues.unboundStrokes++;
-            if (hasColorDetection && maps.detectColors[sHex]) {
+        if (bvStrokes && bvStrokes[s]) {
+          issues.variableBoundStrokes++;
+        } else {
+          issues.unboundStrokes++;
+          if (hasColorDetection) {
+            var sKey = colorToKey(stroke.color);
+            var sMatch = maps.detectColorKeys.get(sKey);
+            if (sMatch) {
               issues.hardcodedOldColors.push({
-                nodeId: node.id, nodeName: node.name, page: getPageName(node),
-                property: 'stroke', paintIndex: s, hex: sHex,
-                oldName: maps.detectColors[sHex],
+                nodeId: node.id, nodeName: node.name, page: nodePageNames[i],
+                property: 'stroke', paintIndex: s, hex: sMatch.hex,
+                oldName: sMatch.label,
               });
             }
           }
@@ -200,11 +250,11 @@ async function runAudit() {
         try {
           var fontName = node.fontName;
           if (fontName && fontName !== figma.mixed) {
-            if (maps.allowedFonts.indexOf(fontName.family) === -1) {
+            if (!maps.allowedFontsSet.has(fontName.family)) {
               issues.fontMismatches.push({
-                nodeId: node.id, nodeName: node.name, page: getPageName(node),
+                nodeId: node.id, nodeName: node.name, page: nodePageNames[i],
                 font: fontName.family, style: fontName.style,
-                expected: maps.allowedFonts.join(', '),
+                expected: Array.from(maps.allowedFontsSet).join(', '),
               });
             }
           }
@@ -213,7 +263,7 @@ async function runAudit() {
     }
 
     if ((i + 1) % batchSize === 0) {
-      sendProgress(i + 1, allNodes.length);
+      sendProgress(i + 1, nodeCount);
       await new Promise(function(r) { setTimeout(r, 0); });
     }
   }
@@ -232,11 +282,12 @@ async function runAudit() {
       for (var sp = 0; sp < pStyle.paints.length; sp++) {
         var paint = pStyle.paints[sp];
         if (paint.type === 'SOLID') {
-          var pHex = rgbaToHex(paint.color).slice(0, 7);
-          if (maps.detectColors[pHex]) {
+          var pKey = colorToKey(paint.color);
+          var pMatch = maps.detectColorKeys.get(pKey);
+          if (pMatch) {
             styleIssues.paint.push({
               styleId: pStyle.id, styleName: pStyle.name,
-              paintIndex: sp, hex: pHex, oldName: maps.detectColors[pHex],
+              paintIndex: sp, hex: pMatch.hex, oldName: pMatch.label,
             });
           }
         }
@@ -249,7 +300,7 @@ async function runAudit() {
       var tStyle = localTextStyles[ts];
       try {
         if (tStyle.fontName && tStyle.fontName.family &&
-            maps.allowedFonts.indexOf(tStyle.fontName.family) === -1) {
+            !maps.allowedFontsSet.has(tStyle.fontName.family)) {
           styleIssues.text.push({
             styleId: tStyle.id, styleName: tStyle.name,
             font: tStyle.fontName.family, style: tStyle.fontName.style,
@@ -265,11 +316,12 @@ async function runAudit() {
       for (var ef = 0; ef < eStyle.effects.length; ef++) {
         var eff = eStyle.effects[ef];
         if (eff.type === 'DROP_SHADOW' || eff.type === 'INNER_SHADOW') {
-          var eHex = rgbaToHex(eff.color).slice(0, 7);
-          if (maps.detectShadowBases[eHex]) {
+          var eKey = colorToKey(eff.color);
+          var eMatch = maps.detectShadowKeys.get(eKey);
+          if (eMatch) {
             styleIssues.effect.push({
               styleId: eStyle.id, styleName: eStyle.name,
-              effectIndex: ef, hex: eHex, oldName: maps.detectShadowBases[eHex],
+              effectIndex: ef, hex: eMatch.hex, oldName: eMatch.label,
             });
           }
         }
@@ -390,6 +442,7 @@ async function runAudit() {
     (config.fix.fontReplace && Object.keys(config.fix.fontReplace).length > 0)
   );
 
+  flushLogs(); // ensure all buffered logs are sent before done message
   figma.ui.postMessage({
     type: 'audit-done',
     summary: summaryData,
@@ -416,81 +469,87 @@ async function runFix(dryRun) {
     effectFixed: 0, effectFailed: 0, effectSkipped: 0,
   };
 
-  // Build color maps
-  var colorMap = {};
+  // Build color maps (Map for O(1) lookups, matching figma-updatevars pattern)
+  var colorMap = new Map();
   if (config.fix.colorToVariable) {
-    Object.keys(config.fix.colorToVariable).forEach(function(hex) {
-      colorMap[hex.toLowerCase()] = config.fix.colorToVariable[hex];
-    });
+    var ctv = config.fix.colorToVariable;
+    var ctvKeys = Object.keys(ctv);
+    for (var ci = 0; ci < ctvKeys.length; ci++) {
+      colorMap.set(ctvKeys[ci].toLowerCase(), ctv[ctvKeys[ci]]);
+    }
   }
-  var hexReplace = {};
+  var hexReplace = new Map();
   if (config.fix.colorReplace) {
-    Object.keys(config.fix.colorReplace).forEach(function(hex) {
-      hexReplace[hex.toLowerCase()] = config.fix.colorReplace[hex].toLowerCase();
-    });
+    var cr = config.fix.colorReplace;
+    var crKeys = Object.keys(cr);
+    for (var ci2 = 0; ci2 < crKeys.length; ci2++) {
+      hexReplace.set(crKeys[ci2].toLowerCase(), cr[crKeys[ci2]].toLowerCase());
+    }
   }
-  var hasColorFix = Object.keys(colorMap).length > 0 || Object.keys(hexReplace).length > 0;
+  var hasColorFix = colorMap.size > 0 || hexReplace.size > 0;
 
   // ── Fix hardcoded colors → bind to variables or replace hex ──
   if (hasColorFix) {
 
-    // Load all COLOR variables and build O(1) lookup maps
+    // Load all COLOR variables and build O(1) lookup maps (Map, like figma-updatevars)
     var allVars = await figma.variables.getLocalVariablesAsync('COLOR');
-    var varByName = {};        // exact name → variable
-    var varBySubstring = {};   // for fallback substring search (lazy)
+    var varByName = new Map();   // exact name → variable
     for (var vi = 0; vi < allVars.length; vi++) {
-      varByName[allVars[vi].name] = allVars[vi];
+      varByName.set(allVars[vi].name, allVars[vi]);
     }
     sendLog('Loaded ' + allVars.length + ' color variables (indexed)');
 
     // Variable lookup: O(1) exact, O(n) substring fallback with cache
-    var varCache = {};  // targetName → variable (memoize)
+    var varCache = new Map();  // targetName → variable (memoize)
     function findVariable(targetName) {
-      if (varCache[targetName] !== undefined) return varCache[targetName];
+      if (varCache.has(targetName)) return varCache.get(targetName);
       // Exact match
-      if (varByName[targetName]) {
-        varCache[targetName] = varByName[targetName];
-        return varByName[targetName];
+      var exact = varByName.get(targetName);
+      if (exact) {
+        varCache.set(targetName, exact);
+        return exact;
       }
       // Substring fallback
       for (var j = 0; j < allVars.length; j++) {
         if (allVars[j].name.indexOf(targetName) !== -1) {
-          varCache[targetName] = allVars[j];
+          varCache.set(targetName, allVars[j]);
           return allVars[j];
         }
       }
-      varCache[targetName] = null;
+      varCache.set(targetName, null);
       return null;
     }
 
     // Pre-resolve all unique hex → variable/replacement ONCE
-    var resolvedVars = {};   // hex → variable | null
-    var resolvedHex = {};    // hex → replacement hex | null
-    var uniqueHexes = {};
-    lastAuditResult.hardcodedOldColors.forEach(function(item) {
-      uniqueHexes[item.hex] = true;
+    var resolvedVars = new Map();   // hex → variable | null
+    var resolvedHex = new Map();    // hex → replacement hex | null
+    var uniqueHexes = new Set();
+    var hcColors = lastAuditResult.hardcodedOldColors;
+    for (var ui = 0; ui < hcColors.length; ui++) {
+      uniqueHexes.add(hcColors[ui].hex);
+    }
+    uniqueHexes.forEach(function(hex) {
+      var targetName = colorMap.get(hex);
+      resolvedVars.set(hex, targetName ? findVariable(targetName) : null);
+      resolvedHex.set(hex, hexReplace.get(hex) || null);
     });
-    Object.keys(uniqueHexes).forEach(function(hex) {
-      var targetName = colorMap[hex];
-      resolvedVars[hex] = targetName ? findVariable(targetName) : null;
-      resolvedHex[hex] = hexReplace[hex] || null;
-    });
-    sendLog('Pre-resolved ' + Object.keys(uniqueHexes).length + ' unique colors');
+    sendLog('Pre-resolved ' + uniqueHexes.size + ' unique colors');
 
     // ── Group fixes by nodeId so we fetch each node ONCE ──
-    var byNode = {};
-    lastAuditResult.hardcodedOldColors.forEach(function(item) {
-      if (!resolvedVars[item.hex] && !resolvedHex[item.hex]) {
+    var byNode = new Map();
+    for (var gi = 0; gi < hcColors.length; gi++) {
+      var gItem = hcColors[gi];
+      if (!resolvedVars.get(gItem.hex) && !resolvedHex.get(gItem.hex)) {
         stats.colorSkipped++;
-        return;
+        continue;
       }
-      if (!byNode[item.nodeId]) byNode[item.nodeId] = [];
-      byNode[item.nodeId].push(item);
-    });
+      var arr = byNode.get(gItem.nodeId);
+      if (!arr) { arr = []; byNode.set(gItem.nodeId, arr); }
+      arr.push(gItem);
+    }
 
-    var nodeIds = Object.keys(byNode);
-    var totalItems = lastAuditResult.hardcodedOldColors.length - stats.colorSkipped;
-    sendLog('\n--- Fixing node colors: ' + totalItems + ' fixes across ' + nodeIds.length + ' unique nodes ---');
+    var totalItems = hcColors.length - stats.colorSkipped;
+    sendLog('\n--- Fixing node colors: ' + totalItems + ' fixes across ' + byNode.size + ' unique nodes ---');
 
     if (stats.colorSkipped > 0) {
       sendLog('  SKIPPED ' + stats.colorSkipped + ' — no mapping', 'info');
@@ -501,20 +560,21 @@ async function runFix(dryRun) {
     var fixCount = 0;
     var logBuf = [];
 
-    function flushLogs() {
+    function flushFixLogs() {
       if (logBuf.length > 0) {
         // Send batched log as a single summary line
         var ok = 0, fail = 0;
-        logBuf.forEach(function(l) { if (l.ok) ok++; else fail++; });
+        for (var li = 0; li < logBuf.length; li++) { if (logBuf[li].ok) ok++; else fail++; }
         if (ok > 0) sendLog('  ✓ ' + ok + ' fixes applied in batch', 'ok');
         if (fail > 0) sendLog('  ✗ ' + fail + ' failures in batch', 'err');
         logBuf = [];
       }
     }
 
-    for (var ni = 0; ni < nodeIds.length; ni++) {
-      var nid = nodeIds[ni];
-      var fixes = byNode[nid];
+    var nodeEntries = Array.from(byNode.entries());
+    for (var ni = 0; ni < nodeEntries.length; ni++) {
+      var nid = nodeEntries[ni][0];
+      var fixes = nodeEntries[ni][1];
 
       if (dryRun) {
         // Dry run: just count, no node fetch needed
@@ -545,14 +605,14 @@ async function runFix(dryRun) {
           var fills = JSON.parse(JSON.stringify(node.fills));
           for (var ff = 0; ff < fillFixes.length; ff++) {
             var ffix = fillFixes[ff];
-            var fVar = resolvedVars[ffix.hex];
+            var fVar = resolvedVars.get(ffix.hex);
             try {
               if (fVar) {
                 fills[ffix.paintIndex] = figma.variables.setBoundVariableForPaint(
                   fills[ffix.paintIndex], 'color', fVar
                 );
               } else {
-                fills[ffix.paintIndex].color = hexToRgb01(resolvedHex[ffix.hex]);
+                fills[ffix.paintIndex].color = hexToRgb01(resolvedHex.get(ffix.hex));
               }
               stats.colorFixed++;
               logBuf.push({ ok: true });
@@ -569,14 +629,14 @@ async function runFix(dryRun) {
           var strokes = JSON.parse(JSON.stringify(node.strokes));
           for (var ss = 0; ss < strokeFixes.length; ss++) {
             var sfix = strokeFixes[ss];
-            var sVar = resolvedVars[sfix.hex];
+            var sVar = resolvedVars.get(sfix.hex);
             try {
               if (sVar) {
                 strokes[sfix.paintIndex] = figma.variables.setBoundVariableForPaint(
                   strokes[sfix.paintIndex], 'color', sVar
                 );
               } else {
-                strokes[sfix.paintIndex].color = hexToRgb01(resolvedHex[sfix.hex]);
+                strokes[sfix.paintIndex].color = hexToRgb01(resolvedHex.get(sfix.hex));
               }
               stats.colorFixed++;
               logBuf.push({ ok: true });
@@ -600,15 +660,15 @@ async function runFix(dryRun) {
 
       // Yield every FIX_BATCH nodes + send progress + flush logs
       if ((ni + 1) % FIX_BATCH === 0) {
-        flushLogs();
+        flushFixLogs();
         sendProgress(fixCount, totalItems);
         await new Promise(function(r) { setTimeout(r, 0); });
       }
     }
-    flushLogs();
+    flushFixLogs();
 
     if (dryRun) {
-      sendLog('  WOULD FIX ' + stats.colorFixed + ' colors across ' + nodeIds.length + ' nodes', 'ok');
+      sendLog('  WOULD FIX ' + stats.colorFixed + ' colors across ' + byNode.size + ' nodes', 'ok');
     }
 
     // Fix paint styles
@@ -617,7 +677,7 @@ async function runFix(dryRun) {
       for (var pi = 0; pi < lastAuditResult.paintStyleIssues.length; pi++) {
         var pItem = lastAuditResult.paintStyleIssues[pi];
 
-        var pVar = resolvedVars[pItem.hex];
+        var pVar = resolvedVars.get(pItem.hex);
         if (pVar) {
           if (dryRun) {
             sendLog('  WOULD BIND style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
@@ -640,7 +700,7 @@ async function runFix(dryRun) {
           continue;
         }
 
-        var pReplHex = resolvedHex[pItem.hex];
+        var pReplHex = resolvedHex.get(pItem.hex);
         if (pReplHex) {
           if (dryRun) {
             sendLog('  WOULD REPLACE style ' + pItem.styleName + ' ' + pItem.hex + ' → ' + pReplHex, 'ok');
@@ -670,7 +730,7 @@ async function runFix(dryRun) {
       sendLog('\n--- Fixing effect styles (' + lastAuditResult.effectStyleIssues.length + ') ---');
       for (var ei = 0; ei < lastAuditResult.effectStyleIssues.length; ei++) {
         var eItem = lastAuditResult.effectStyleIssues[ei];
-        var eReplHex = hexReplace[eItem.hex];
+        var eReplHex = hexReplace.get(eItem.hex);
         if (!eReplHex) {
           sendLog('  SKIP effect ' + eItem.styleName + ' — no colorReplace for ' + eItem.hex, 'info');
           stats.effectSkipped++;
@@ -819,6 +879,7 @@ async function runFix(dryRun) {
     sendLog('\nRe-run audit to verify results.', 'info');
   }
 
+  flushLogs(); // ensure all buffered logs are sent before done message
   figma.ui.postMessage({
     type: 'fix-done',
     stats: stats,

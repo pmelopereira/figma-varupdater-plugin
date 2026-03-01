@@ -379,6 +379,19 @@
         logEl.scrollTop = logEl.scrollHeight;
       }
 
+      if (msg.type === 'log-batch') {
+        var frag = document.createDocumentFragment();
+        var items = msg.items;
+        for (var li = 0; li < items.length; li++) {
+          var sp = document.createElement('span');
+          sp.className = items[li].level || 'info';
+          sp.textContent = items[li].text + '\n';
+          frag.appendChild(sp);
+        }
+        logEl.appendChild(frag);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
       if (msg.type === 'progress') {
         var pct = Math.round(msg.current / msg.total * 100);
         progressFill.style.width = pct + '%';
