@@ -398,7 +398,8 @@ async function runAudit() {
 }
 
 // ──────────────────────────────────────────────
-// Fix All
+// Fix All  (optimized: batch by node, O(1) variable
+//           lookup, throttled logging, yielded batches)
 // ──────────────────────────────────────────────
 async function runFix(dryRun) {
   if (!lastAuditResult || !config || !config.fix) {
@@ -433,98 +434,181 @@ async function runFix(dryRun) {
   // ── Fix hardcoded colors → bind to variables or replace hex ──
   if (hasColorFix) {
 
-    // Load all COLOR variables for lookup
+    // Load all COLOR variables and build O(1) lookup maps
     var allVars = await figma.variables.getLocalVariablesAsync('COLOR');
-    sendLog('Loaded ' + allVars.length + ' color variables for lookup');
+    var varByName = {};        // exact name → variable
+    var varBySubstring = {};   // for fallback substring search (lazy)
+    for (var vi = 0; vi < allVars.length; vi++) {
+      varByName[allVars[vi].name] = allVars[vi];
+    }
+    sendLog('Loaded ' + allVars.length + ' color variables (indexed)');
 
+    // Variable lookup: O(1) exact, O(n) substring fallback with cache
+    var varCache = {};  // targetName → variable (memoize)
     function findVariable(targetName) {
-      // Exact match first
-      for (var i = 0; i < allVars.length; i++) {
-        if (allVars[i].name === targetName) return allVars[i];
+      if (varCache[targetName] !== undefined) return varCache[targetName];
+      // Exact match
+      if (varByName[targetName]) {
+        varCache[targetName] = varByName[targetName];
+        return varByName[targetName];
       }
-      // Substring match
+      // Substring fallback
       for (var j = 0; j < allVars.length; j++) {
-        if (allVars[j].name.indexOf(targetName) !== -1) return allVars[j];
+        if (allVars[j].name.indexOf(targetName) !== -1) {
+          varCache[targetName] = allVars[j];
+          return allVars[j];
+        }
       }
+      varCache[targetName] = null;
       return null;
     }
 
-    // Fix node fills / strokes
-    sendLog('\n--- Fixing node colors (' + lastAuditResult.hardcodedOldColors.length + ') ---');
-    for (var ci = 0; ci < lastAuditResult.hardcodedOldColors.length; ci++) {
-      var item = lastAuditResult.hardcodedOldColors[ci];
+    // Pre-resolve all unique hex → variable/replacement ONCE
+    var resolvedVars = {};   // hex → variable | null
+    var resolvedHex = {};    // hex → replacement hex | null
+    var uniqueHexes = {};
+    lastAuditResult.hardcodedOldColors.forEach(function(item) {
+      uniqueHexes[item.hex] = true;
+    });
+    Object.keys(uniqueHexes).forEach(function(hex) {
+      var targetName = colorMap[hex];
+      resolvedVars[hex] = targetName ? findVariable(targetName) : null;
+      resolvedHex[hex] = hexReplace[hex] || null;
+    });
+    sendLog('Pre-resolved ' + Object.keys(uniqueHexes).length + ' unique colors');
 
-      // Strategy 1: bind to variable
-      var targetVarName = colorMap[item.hex];
-      var variable = targetVarName ? findVariable(targetVarName) : null;
-
-      if (variable) {
-        if (dryRun) {
-          sendLog('  WOULD BIND ' + item.nodeName + ' ' + item.property + ' ' + item.hex + ' → ' + variable.name, 'ok');
-          stats.colorFixed++;
-          continue;
-        }
-        try {
-          var node = await figma.getNodeByIdAsync(item.nodeId);
-          if (!node) throw new Error('node not found');
-          if (item.property === 'fill') {
-            var fills = JSON.parse(JSON.stringify(node.fills));
-            fills[item.paintIndex] = figma.variables.setBoundVariableForPaint(
-              fills[item.paintIndex], 'color', variable
-            );
-            node.fills = fills;
-          } else {
-            var strokes = JSON.parse(JSON.stringify(node.strokes));
-            strokes[item.paintIndex] = figma.variables.setBoundVariableForPaint(
-              strokes[item.paintIndex], 'color', variable
-            );
-            node.strokes = strokes;
-          }
-          sendLog('  BOUND ' + item.nodeName + ' ' + item.property + ' → ' + variable.name, 'ok');
-          stats.colorFixed++;
-        } catch (e) {
-          sendLog('  FAIL ' + item.nodeName + ' — ' + e.message, 'err');
-          stats.colorFailed++;
-        }
-        continue;
+    // ── Group fixes by nodeId so we fetch each node ONCE ──
+    var byNode = {};
+    lastAuditResult.hardcodedOldColors.forEach(function(item) {
+      if (!resolvedVars[item.hex] && !resolvedHex[item.hex]) {
+        stats.colorSkipped++;
+        return;
       }
+      if (!byNode[item.nodeId]) byNode[item.nodeId] = [];
+      byNode[item.nodeId].push(item);
+    });
 
-      // Strategy 2: direct hex replacement
-      var replHex = hexReplace[item.hex];
-      if (replHex) {
-        if (dryRun) {
-          sendLog('  WOULD REPLACE ' + item.nodeName + ' ' + item.property + ' ' + item.hex + ' → ' + replHex, 'ok');
-          stats.colorFixed++;
-          continue;
-        }
-        try {
-          var rNode = await figma.getNodeByIdAsync(item.nodeId);
-          if (!rNode) throw new Error('node not found');
-          var newRgb = hexToRgb01(replHex);
-          if (item.property === 'fill') {
-            var rFills = JSON.parse(JSON.stringify(rNode.fills));
-            rFills[item.paintIndex].color = newRgb;
-            rNode.fills = rFills;
-          } else {
-            var rStrokes = JSON.parse(JSON.stringify(rNode.strokes));
-            rStrokes[item.paintIndex].color = newRgb;
-            rNode.strokes = rStrokes;
-          }
-          sendLog('  REPLACED ' + item.nodeName + ' ' + item.property + ' → ' + replHex, 'ok');
-          stats.colorFixed++;
-        } catch (e) {
-          sendLog('  FAIL ' + item.nodeName + ' — ' + e.message, 'err');
-          stats.colorFailed++;
-        }
-        continue;
-      }
+    var nodeIds = Object.keys(byNode);
+    var totalItems = lastAuditResult.hardcodedOldColors.length - stats.colorSkipped;
+    sendLog('\n--- Fixing node colors: ' + totalItems + ' fixes across ' + nodeIds.length + ' unique nodes ---');
 
-      stats.colorSkipped++;
+    if (stats.colorSkipped > 0) {
+      sendLog('  SKIPPED ' + stats.colorSkipped + ' — no mapping', 'info');
     }
 
-    // Deduplicate skip messages
-    if (stats.colorSkipped > 0) {
-      sendLog('  SKIPPED ' + stats.colorSkipped + ' nodes — no mapping', 'info');
+    // Process nodes in batches, yielding to keep Figma responsive
+    var FIX_BATCH = 200;
+    var fixCount = 0;
+    var logBuf = [];
+
+    function flushLogs() {
+      if (logBuf.length > 0) {
+        // Send batched log as a single summary line
+        var ok = 0, fail = 0;
+        logBuf.forEach(function(l) { if (l.ok) ok++; else fail++; });
+        if (ok > 0) sendLog('  ✓ ' + ok + ' fixes applied in batch', 'ok');
+        if (fail > 0) sendLog('  ✗ ' + fail + ' failures in batch', 'err');
+        logBuf = [];
+      }
+    }
+
+    for (var ni = 0; ni < nodeIds.length; ni++) {
+      var nid = nodeIds[ni];
+      var fixes = byNode[nid];
+
+      if (dryRun) {
+        // Dry run: just count, no node fetch needed
+        for (var di = 0; di < fixes.length; di++) {
+          stats.colorFixed++;
+        }
+        fixCount += fixes.length;
+        if (fixCount % (FIX_BATCH * 5) === 0) {
+          sendProgress(fixCount, totalItems);
+        }
+        continue;
+      }
+
+      try {
+        var node = await figma.getNodeByIdAsync(nid);
+        if (!node) throw new Error('node not found: ' + nid);
+
+        // Separate fills and strokes for this node
+        var fillFixes = [];
+        var strokeFixes = [];
+        for (var fi2 = 0; fi2 < fixes.length; fi2++) {
+          if (fixes[fi2].property === 'fill') fillFixes.push(fixes[fi2]);
+          else strokeFixes.push(fixes[fi2]);
+        }
+
+        // Apply all fill fixes in one write
+        if (fillFixes.length > 0 && 'fills' in node) {
+          var fills = JSON.parse(JSON.stringify(node.fills));
+          for (var ff = 0; ff < fillFixes.length; ff++) {
+            var ffix = fillFixes[ff];
+            var fVar = resolvedVars[ffix.hex];
+            try {
+              if (fVar) {
+                fills[ffix.paintIndex] = figma.variables.setBoundVariableForPaint(
+                  fills[ffix.paintIndex], 'color', fVar
+                );
+              } else {
+                fills[ffix.paintIndex].color = hexToRgb01(resolvedHex[ffix.hex]);
+              }
+              stats.colorFixed++;
+              logBuf.push({ ok: true });
+            } catch (e) {
+              stats.colorFailed++;
+              logBuf.push({ ok: false });
+            }
+          }
+          node.fills = fills;
+        }
+
+        // Apply all stroke fixes in one write
+        if (strokeFixes.length > 0 && 'strokes' in node) {
+          var strokes = JSON.parse(JSON.stringify(node.strokes));
+          for (var ss = 0; ss < strokeFixes.length; ss++) {
+            var sfix = strokeFixes[ss];
+            var sVar = resolvedVars[sfix.hex];
+            try {
+              if (sVar) {
+                strokes[sfix.paintIndex] = figma.variables.setBoundVariableForPaint(
+                  strokes[sfix.paintIndex], 'color', sVar
+                );
+              } else {
+                strokes[sfix.paintIndex].color = hexToRgb01(resolvedHex[sfix.hex]);
+              }
+              stats.colorFixed++;
+              logBuf.push({ ok: true });
+            } catch (e) {
+              stats.colorFailed++;
+              logBuf.push({ ok: false });
+            }
+          }
+          node.strokes = strokes;
+        }
+
+      } catch (e) {
+        // Entire node failed — count all its fixes as failed
+        for (var ef2 = 0; ef2 < fixes.length; ef2++) {
+          stats.colorFailed++;
+          logBuf.push({ ok: false });
+        }
+      }
+
+      fixCount += fixes.length;
+
+      // Yield every FIX_BATCH nodes + send progress + flush logs
+      if ((ni + 1) % FIX_BATCH === 0) {
+        flushLogs();
+        sendProgress(fixCount, totalItems);
+        await new Promise(function(r) { setTimeout(r, 0); });
+      }
+    }
+    flushLogs();
+
+    if (dryRun) {
+      sendLog('  WOULD FIX ' + stats.colorFixed + ' colors across ' + nodeIds.length + ' nodes', 'ok');
     }
 
     // Fix paint styles
@@ -533,10 +617,7 @@ async function runFix(dryRun) {
       for (var pi = 0; pi < lastAuditResult.paintStyleIssues.length; pi++) {
         var pItem = lastAuditResult.paintStyleIssues[pi];
 
-        // Strategy 1: bind to variable
-        var pTargetName = colorMap[pItem.hex];
-        var pVar = pTargetName ? findVariable(pTargetName) : null;
-
+        var pVar = resolvedVars[pItem.hex];
         if (pVar) {
           if (dryRun) {
             sendLog('  WOULD BIND style ' + pItem.styleName + ' → ' + pVar.name, 'ok');
@@ -559,8 +640,7 @@ async function runFix(dryRun) {
           continue;
         }
 
-        // Strategy 2: direct hex replacement
-        var pReplHex = hexReplace[pItem.hex];
+        var pReplHex = resolvedHex[pItem.hex];
         if (pReplHex) {
           if (dryRun) {
             sendLog('  WOULD REPLACE style ' + pItem.styleName + ' ' + pItem.hex + ' → ' + pReplHex, 'ok');
@@ -630,7 +710,28 @@ async function runFix(dryRun) {
     });
     var fallbackFont = fontMap['*'] || null;
 
+    // Pre-load all target fonts once
+    var loadedFonts = {};
     sendLog('\n--- Fixing fonts ---');
+
+    async function ensureFont(family, style) {
+      var key = family + '|' + style;
+      if (loadedFonts[key]) return style;
+      try {
+        await figma.loadFontAsync({ family: family, style: style });
+        loadedFonts[key] = true;
+        return style;
+      } catch (e) {
+        var fallStyle = 'Regular';
+        var fkey = family + '|' + fallStyle;
+        if (!loadedFonts[fkey]) {
+          await figma.loadFontAsync({ family: family, style: fallStyle });
+          loadedFonts[fkey] = true;
+        }
+        return fallStyle;
+      }
+    }
+
     for (var fi = 0; fi < lastAuditResult.fontMismatches.length; fi++) {
       var fItem = lastAuditResult.fontMismatches[fi];
       var targetFont = fontMap[fItem.font.toLowerCase()] || fallbackFont;
@@ -650,26 +751,26 @@ async function runFix(dryRun) {
         var fNode = await figma.getNodeByIdAsync(fItem.nodeId);
         if (!fNode || fNode.type !== 'TEXT') throw new Error('not a text node');
 
-        // Try same style, fall back to Regular
-        var targetStyle = fItem.style || 'Regular';
-        try {
-          await figma.loadFontAsync({ family: targetFont, style: targetStyle });
-        } catch (e) {
-          targetStyle = 'Regular';
-          await figma.loadFontAsync({ family: targetFont, style: 'Regular' });
-        }
+        var actualStyle = await ensureFont(targetFont, fItem.style || 'Regular');
         // Also load source font so Figma can read segments
         try {
           await figma.loadFontAsync({ family: fItem.font, style: fItem.style || 'Regular' });
         } catch (e) { /* best effort */ }
 
-        fNode.fontName = { family: targetFont, style: targetStyle };
-        sendLog('  FIXED ' + fItem.nodeName + ' → ' + targetFont + ' ' + targetStyle, 'ok');
+        fNode.fontName = { family: targetFont, style: actualStyle };
         stats.fontFixed++;
       } catch (e) {
         sendLog('  FAIL ' + fItem.nodeName + ' — ' + e.message, 'err');
         stats.fontFailed++;
       }
+
+      if ((fi + 1) % FIX_BATCH === 0) {
+        sendLog('  Fonts: ' + stats.fontFixed + '/' + lastAuditResult.fontMismatches.length, 'ok');
+        await new Promise(function(r) { setTimeout(r, 0); });
+      }
+    }
+    if (stats.fontFixed > 0) {
+      sendLog('  Fixed ' + stats.fontFixed + ' font nodes', 'ok');
     }
 
     // Fix text styles
@@ -690,15 +791,9 @@ async function runFix(dryRun) {
           var tStyle = figma.getStyleById(tItem.styleId);
           if (!tStyle) throw new Error('style not found');
 
-          var tsStyle = tItem.style || 'Regular';
-          try {
-            await figma.loadFontAsync({ family: tTarget, style: tsStyle });
-          } catch (e) {
-            tsStyle = 'Regular';
-            await figma.loadFontAsync({ family: tTarget, style: 'Regular' });
-          }
-          tStyle.fontName = { family: tTarget, style: tsStyle };
-          sendLog('  FIXED text style ' + tItem.styleName + ' → ' + tTarget + ' ' + tsStyle, 'ok');
+          var tActualStyle = await ensureFont(tTarget, tItem.style || 'Regular');
+          tStyle.fontName = { family: tTarget, style: tActualStyle };
+          sendLog('  FIXED text style ' + tItem.styleName + ' → ' + tTarget + ' ' + tActualStyle, 'ok');
           stats.styleFixed++;
         } catch (e) {
           sendLog('  FAIL text style ' + tItem.styleName + ' — ' + e.message, 'err');

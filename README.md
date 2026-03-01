@@ -1,4 +1,4 @@
-# figma-updatevars-plugin
+# Figma Update Vars
 
 A Figma plugin toolkit for design system retheming: batch-update Local Variables, audit for old-theme remnants, auto-fix issues, and generate code tokens — all config-driven, no hardcoded values.
 
@@ -64,14 +64,14 @@ A Figma plugin toolkit for design system retheming: batch-update Local Variables
 Open the Figma file → Tokens Studio plugin → Export Variables as JSON. Then convert:
 
 ```bash
-python3 scripts/figma-vars-to-overrides.py tokens-before.json --skip-aliases -o before.json
+python3 scripts/figma-vars-to-overrides.py tokens-before.json --skip-aliases -o overrides-before.json
 ```
 
 **Step 2 — Apply variable changes**
 
-Create or obtain an overrides JSON (manually, or from a brand token generator), then:
+Update overrides to match project brand. Then apply them to your Design System in Figma.
 
-1. Figma → Plugins → Development → **figma-updatevars-plugin**
+1. Figma → Plugins → Development → **Figma Update Vars**
 2. Drop `overrides.json` → preview → Apply
 
 **Step 3 — Snapshot "after"**
@@ -79,7 +79,7 @@ Create or obtain an overrides JSON (manually, or from a brand token generator), 
 Go back to Figma → open Tokens Studio plugin again. It reads the current (now updated) variable values. Export as JSON, then convert:
 
 ```bash
-python3 scripts/figma-vars-to-overrides.py tokens-after.json --skip-aliases -o after.json
+python3 scripts/figma-vars-to-overrides.py tokens-after.json --skip-aliases -o overrides-final.json
 ```
 
 > **Why re-export?** Tokens Studio reads whatever values the variables currently hold. After the varupdater plugin changed them in Step 2, the export reflects the new values.
@@ -88,11 +88,11 @@ python3 scripts/figma-vars-to-overrides.py tokens-after.json --skip-aliases -o a
 
 ```bash
 python3 scripts/generate-audit-config.py \
-    --before before.json \
-    --after  after.json \
+    --before overrides.json \
+    --after  overrides-final.json \
     --fonts  Sora,Inter \
     --name   "My Rebrand" \
-    -o       my-audit.json
+    -o       audit.json
 ```
 
 This diffs every variable, detects which changed, and builds:
@@ -106,7 +106,7 @@ This diffs every variable, detects which changed, and builds:
 **Step 5 — Audit and fix**
 
 1. Figma → Plugins → Development → **Design System Auditor**
-2. Drop `my-audit.json`
+2. Drop `audit.json`
 3. **Run Audit** — scans all nodes, styles, effects
 4. **Fix All** (dry run checked) — preview what would change
 5. **Fix All** (dry run unchecked) — apply: binds variables, replaces colors, fixes fonts
@@ -116,7 +116,7 @@ This diffs every variable, detects which changed, and builds:
 **Step 6 — Code tokens** (optional)
 
 ```bash
-python3 scripts/generate-code-tokens.py after.json -o ./code-tokens
+python3 scripts/generate-code-tokens.py overrides-final.json -o ./code-tokens
 # Produces: tokens.css + tailwind-tokens.mjs
 ```
 
@@ -128,7 +128,7 @@ python3 scripts/generate-code-tokens.py after.json -o ./code-tokens
 
 1. In Figma → **Plugins → Development → Import plugin from manifest…**
 2. Select `manifest.json` from the repo root
-3. Appears under **Plugins → Development → figma-updatevars-plugin**
+3. Appears under **Plugins → Development → Figma Update Vars**
 
 ### Features
 

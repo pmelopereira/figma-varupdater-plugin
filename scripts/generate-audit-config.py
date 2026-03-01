@@ -42,6 +42,15 @@ import os
 # Shadow-related variable name patterns (substring match)
 SHADOW_PATTERNS = ["shadow", "effect"]
 
+# Colors too common to flag — they appear legitimately on thousands of nodes.
+# e.g. #ffffff is used for white backgrounds, white text on dark, icons, etc.
+# even if a variable changed FROM that value, flagging it produces false positives.
+COMMON_COLORS = {
+    "#ffffff",  # pure white
+    "#000000",  # pure black
+    "#00000000",  # fully transparent (normalised → #000000)
+}
+
 
 def load_overrides(path):
     """Load overrides JSON array."""
@@ -89,11 +98,13 @@ def var_path(entry):
     return f"{col}/{var}" if col else var
 
 
-def generate_config(before_path, after_path, fonts, name, shadow_bases_extra=None):
+def generate_config(before_path, after_path, fonts, name,
+                     shadow_bases_extra=None, include_common=False):
     """Generate audit config from before/after overrides."""
 
     after = load_overrides(after_path)
     after_map = {make_key(e): e for e in after}
+    skipped = []
 
     detect_colors = {}
     detect_shadow_bases = {}
@@ -120,6 +131,11 @@ def generate_config(before_path, after_path, fonts, name, shadow_bases_extra=Non
             new_hex = normalise_hex(new_val)
 
             if old_hex == new_hex:
+                continue
+
+            # Skip ubiquitous colors (false positives)
+            if not include_common and old_hex in COMMON_COLORS:
+                skipped.append((old_hex, old_entry.get("variable", "?")))
                 continue
 
             # Build label from variable name
@@ -169,8 +185,25 @@ def generate_config(before_path, after_path, fonts, name, shadow_bases_extra=Non
     if fix_color_replace:
         config["fix"]["colorReplace"] = dict(sorted(fix_color_replace.items()))
     if fonts:
-        # Default: replace any non-allowed font with the first allowed font
-        config["fix"]["fontReplace"] = {"*": fonts[0]}
+        # Default: replace any non-allowed font with the last font in the list,
+        # which should be the primary body/UI font (e.g. Inter).
+        # Display/heading fonts like Sora should be listed first.
+        config["fix"]["fontReplace"] = {"*": fonts[-1]}
+
+    if skipped:
+        # Deduplicate and warn
+        seen = set()
+        unique = []
+        for hex_val, var_name in skipped:
+            if hex_val not in seen:
+                seen.add(hex_val)
+                unique.append((hex_val, var_name))
+        print(f"Skipped {len(skipped)} common-color entries "
+              f"({len(unique)} unique hex) to avoid false positives:",
+              file=sys.stderr)
+        for h, v in unique:
+            print(f"  {h} (e.g. {v})", file=sys.stderr)
+        print("Use --include-common to include them.", file=sys.stderr)
 
     return config
 
@@ -199,6 +232,12 @@ def main():
         "--output", "-o",
         help="Output file path (default: stdout)"
     )
+    parser.add_argument(
+        "--include-common",
+        action="store_true",
+        help="Include common colors (#ffffff, #000000) that are normally "
+             "skipped to avoid false positives"
+    )
 
     args = parser.parse_args()
 
@@ -209,7 +248,8 @@ def main():
               "generated (detect section will be empty).", file=sys.stderr)
         print("For full config, provide both --before and --after.", file=sys.stderr)
 
-    config = generate_config(args.before, args.after, fonts, args.name)
+    config = generate_config(args.before, args.after, fonts, args.name,
+                              include_common=args.include_common)
 
     output_json = json.dumps(config, indent=2, ensure_ascii=False)
 
